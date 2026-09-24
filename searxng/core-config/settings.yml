@@ -1,0 +1,35 @@
+# SearXNG configuration for a private (LAN / ZeroTier only) instance.
+#
+# Secrets and instance flags (SEARXNG_SECRET, SEARXNG_LIMITER,
+# SEARXNG_PUBLIC_INSTANCE, SEARXNG_IMAGE_PROXY) are provided as environment
+# variables by docker-compose.yml.
+#
+# Docs: https://docs.searxng.org/admin/settings/index.html
+use_default_settings: true
+
+general:
+  debug: false
+  instance_name: "Private SearXNG"
+
+search:
+  safe_search: 0
+  autocomplete: ""
+  default_lang: ""
+  # The JSON API is what the MCP server calls. Remove "json" to deny API access.
+  formats:
+    - html
+    - json
+
+server:
+  limiter: false
+  public_instance: false
+
+ui:
+  static_use_hash: true
+
+# These engines need a Tor proxy, which this stack does not use.
+engines:
+  - name: ahmia
+    disabled: true
+  - name: torch
+    disabled: true

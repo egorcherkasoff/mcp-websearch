@@ -1,0 +1,91 @@
+# MCP web-search / scraping stack: SearXNG + Crawl4AI + MCP wrapper.
+#
+# Private deployment: published ports are meant to be reachable only from the
+# local network (LAN) or a ZeroTier network. Never expose them to the internet.
+name: mcp-websearch
+
+services:
+  # Self-hosted metasearch engine. Exposes a JSON API that the MCP server uses
+  # and a web UI for humans.
+  searxng:
+    image: docker.io/searxng/searxng:${SEARXNG_IMAGE_TAG:-latest}
+    container_name: mcp-websearch-searxng
+    restart: unless-stopped
+    environment:
+      SEARXNG_SECRET: ${SEARXNG_SECRET:?SEARXNG_SECRET is not set - create .env from .env.example}
+      SEARXNG_LIMITER: "false" # private instance: the limiter would only block our own API calls
+      SEARXNG_PUBLIC_INSTANCE: "false"
+      SEARXNG_IMAGE_PROXY: "false"
+      # Keep the mounted config owned by the host user so it stays editable
+      # without sudo. The container only needs to read it.
+      FORCE_OWNERSHIP: "false"
+    volumes:
+      - ./searxng/core-config:/etc/searxng:rw
+      - searxng-data:/var/cache/searxng
+    ports:
+      - "${BIND_ADDR:-0.0.0.0}:${SEARXNG_PORT:-8088}:8080"
+    networks: [websearch]
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:8080/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+  # Headless-browser scraper with a REST API. No published ports: reachable only
+  # from the compose network (via the MCP server).
+  crawl4ai:
+    image: unclecode/crawl4ai:${CRAWL4AI_IMAGE_TAG:-latest}
+    container_name: mcp-websearch-crawl4ai
+    restart: unless-stopped
+    shm_size: 1gb # required by Chromium inside the image
+    environment:
+      # With a token set, the server binds [::]:11235 and enforces bearer auth
+      # on its REST API. Without it, the image binds loopback only and other
+      # containers cannot reach it.
+      CRAWL4AI_API_TOKEN: ${CRAWL4AI_API_TOKEN:?CRAWL4AI_API_TOKEN is not set - create .env from .env.example}
+    networks: [websearch]
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:11235/health', timeout=5)",
+        ]
+      interval: 30s
+      timeout: 10s
+      retries: 10
+      start_period: 60s
+
+  # The MCP server itself: combines web_search (SearXNG) and scrape_url(s)
+  # (Crawl4AI) behind one Streamable HTTP endpoint with bearer-token auth.
+  mcp:
+    build:
+      context: ./mcp-server
+    image: mcp-websearch/mcp-server:local
+    container_name: mcp-websearch-server
+    restart: unless-stopped
+    environment:
+      SEARXNG_URL: http://searxng:8080
+      CRAWL4AI_URL: http://crawl4ai:11235
+      CRAWL4AI_API_TOKEN: ${CRAWL4AI_API_TOKEN:?CRAWL4AI_API_TOKEN is not set - create .env from .env.example}
+      MCP_AUTH_TOKEN: ${MCP_AUTH_TOKEN:?MCP_AUTH_TOKEN is not set - create .env from .env.example}
+      MCP_HOST: 0.0.0.0
+      MCP_PORT: "8765"
+      MCP_HTTP_TIMEOUT: "300"
+    ports:
+      - "${BIND_ADDR:-0.0.0.0}:${MCP_PORT:-8765}:8765"
+    depends_on:
+      searxng:
+        condition: service_healthy
+      crawl4ai:
+        condition: service_healthy
+    networks: [websearch]
+
+networks:
+  websearch:
+    driver: bridge
+
+volumes:
+  searxng-data:
