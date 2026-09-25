@@ -7,14 +7,22 @@ Tools:
   * scrape_urls - batch version of scrape_url (up to 10 pages)
 
 Transport: Streamable HTTP on MCP_HOST:MCP_PORT, endpoint /mcp.
-Auth:      optional static bearer token (MCP_AUTH_TOKEN); /healthz stays open.
+Auth:      MCP_AUTH_TOKEN is REQUIRED. The server refuses to start without it and
+           every request except /healthz must carry "Authorization: Bearer ...".
+SSRF:      scrape_url/scrape_urls refuse loopback/private/link-local/metadata
+           targets unless MCP_ALLOW_PRIVATE_TARGETS=true is set explicitly.
 """
 
 from __future__ import annotations
 
+import asyncio
 import hmac
+import ipaddress
 import json
+import logging
 import os
+import socket
+import urllib.parse
 from typing import Any
 
 import httpx
@@ -24,10 +32,15 @@ from mcp.server.fastmcp import FastMCP
 SEARXNG_URL = os.environ.get("SEARXNG_URL", "http://searxng:8080").rstrip("/")
 CRAWL4AI_URL = os.environ.get("CRAWL4AI_URL", "http://crawl4ai:11235").rstrip("/")
 CRAWL4AI_API_TOKEN = os.environ.get("CRAWL4AI_API_TOKEN", "").strip()
-AUTH_TOKEN = os.environ.get("MCP_AUTH_TOKEN", "").strip()
-HOST = os.environ.get("MCP_HOST", "0.0.0.0")
+HOST = os.environ.get("MCP_HOST", "127.0.0.1")
 PORT = int(os.environ.get("MCP_PORT", "8765"))
 HTTP_TIMEOUT = float(os.environ.get("MCP_HTTP_TIMEOUT", "300"))
+ALLOW_PRIVATE_TARGETS = os.environ.get("MCP_ALLOW_PRIVATE_TARGETS", "").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
 
 MAX_RESULTS_LIMIT = 20
 MAX_SCRAPE_URLS = 10
@@ -134,6 +147,120 @@ async def web_search(
 
 
 # --------------------------------------------------------------------------- #
+# SSRF guard for scrape_url / scrape_urls
+# --------------------------------------------------------------------------- #
+
+# Ranges that must never be reachable through the scrape tools: loopback,
+# private/CGNAT, link-local (incl. cloud metadata 169.254.169.254), multicast,
+# reserved/documentation and IPv6 equivalents.
+BLOCKED_NETWORKS = tuple(
+    ipaddress.ip_network(net)
+    for net in (
+        "0.0.0.0/8",
+        "10.0.0.0/8",
+        "100.64.0.0/10",
+        "127.0.0.0/8",
+        "169.254.0.0/16",
+        "172.16.0.0/12",
+        "192.0.0.0/24",
+        "192.0.2.0/24",
+        "192.168.0.0/16",
+        "198.18.0.0/15",
+        "198.51.100.0/24",
+        "203.0.113.0/24",
+        "224.0.0.0/4",
+        "240.0.0.0/4",
+        "::/128",
+        "::1/128",
+        "64:ff9b::/96",
+        "100::/64",
+        "2001::/32",
+        "2001:db8::/32",
+        "2002::/16",
+        "fc00::/7",
+        "fe80::/10",
+        "ff00::/8",
+    )
+)
+
+
+def _is_blocked_ip(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
+    """True when `ip` belongs to a non-public range (IPv4-mapped v6 unwrapped)."""
+    if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped is not None:
+        ip = ip.ipv4_mapped
+    return any(ip in network for network in BLOCKED_NETWORKS)
+
+
+def _parse_target(url: str) -> tuple[str, int]:
+    parsed = urllib.parse.urlsplit(url)
+    if parsed.scheme not in ("http", "https"):
+        raise ValueError("url must start with http:// or https://")
+    host = parsed.hostname
+    if not host:
+        raise ValueError(f"url has no host: {url!r}")
+    port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    return host, port
+
+
+async def _resolve_host(
+    host: str, port: int
+) -> list[ipaddress.IPv4Address | ipaddress.IPv6Address]:
+    loop = asyncio.get_running_loop()
+    try:
+        infos = await loop.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+    except socket.gaierror as exc:
+        raise ValueError(f"cannot resolve host {host!r}: {exc}") from exc
+    addresses = set()
+    for *_, sockaddr in infos:
+        try:
+            addresses.add(ipaddress.ip_address(sockaddr[0]))
+        except ValueError:
+            continue
+    if not addresses:
+        raise ValueError(f"host {host!r} did not resolve to any usable address")
+    return sorted(addresses, key=lambda ip: (ip.version, int(ip)))
+
+
+async def _assert_public_target(url: str) -> None:
+    """Fail closed when `url` points at a non-public address.
+
+    Every address the host resolves to is checked. Crawl4AI resolves the name
+    again when it fetches, so a DNS-rebinding attacker could still race this
+    check; the guard raises the bar but is not a network-level guarantee.
+    """
+    if ALLOW_PRIVATE_TARGETS:
+        return
+    host, port = _parse_target(url)
+    try:
+        literal = ipaddress.ip_address(host)
+    except ValueError:
+        addresses = await _resolve_host(host, port)
+    else:
+        addresses = [literal]
+    blocked = sorted(str(ip) for ip in addresses if _is_blocked_ip(ip))
+    if blocked:
+        raise ValueError(
+            f"refusing to fetch private/internal address {', '.join(blocked)} "
+            f"(host {host!r}); set MCP_ALLOW_PRIVATE_TARGETS=true to override"
+        )
+
+
+async def _block_private_redirect(result: dict[str, Any]) -> None:
+    """Drop the body of a result whose final URL (after redirects) is non-public."""
+    if ALLOW_PRIVATE_TARGETS:
+        return
+    final_url = result.get("final_url")
+    if not final_url or final_url == result.get("url"):
+        return
+    try:
+        await _assert_public_target(final_url)
+    except ValueError as exc:
+        result["success"] = False
+        result["content"] = ""
+        result["error"] = f"blocked redirect to non-public target: {exc}"
+
+
+# --------------------------------------------------------------------------- #
 # Crawl4AI
 # --------------------------------------------------------------------------- #
 
@@ -220,7 +347,9 @@ async def _crawl4ai(urls: list[str], include_links: bool) -> list[dict[str, Any]
     results = data.get("results") or []
     if not results:
         raise RuntimeError("Crawl4AI returned no results")
-    return [_shape_result(item, include_links) for item in results]
+    shaped = [_shape_result(item, include_links) for item in results]
+    await asyncio.gather(*(_block_private_redirect(item) for item in shaped))
+    return shaped
 
 
 @mcp.tool()
@@ -241,6 +370,7 @@ async def scrape_url(
     """
     if not url.startswith(("http://", "https://")):
         raise ValueError("url must start with http:// or https://")
+    await _assert_public_target(url)
     max_chars = max(500, int(max_chars))
     results = await _crawl4ai([url], include_links)
     return _truncate(results[0], max_chars)
@@ -264,6 +394,7 @@ async def scrape_urls(
         raise ValueError("no valid http(s) URLs provided")
     if len(cleaned) > MAX_SCRAPE_URLS:
         raise ValueError(f"too many URLs: {len(cleaned)} (max {MAX_SCRAPE_URLS})")
+    await asyncio.gather(*(_assert_public_target(url) for url in cleaned))
     max_chars = max(500, int(max_chars))
     results = await _crawl4ai(cleaned, include_links)
     return {"pages": [_truncate(item, max_chars) for item in results]}
@@ -292,6 +423,8 @@ class BearerAuthMiddleware:
     """Pure-ASGI bearer-token check. /healthz stays open for container healthchecks."""
 
     def __init__(self, app: Any, token: str) -> None:
+        if not token or not token.strip():
+            raise ValueError("BearerAuthMiddleware requires a non-empty token")
         self.app = app
         self.token = token
 
@@ -310,10 +443,35 @@ class BearerAuthMiddleware:
         await self.app(scope, receive, send)
 
 
+def _require_auth_token() -> str:
+    """Return the configured bearer token or fail closed (CWE-306)."""
+    token = os.environ.get("MCP_AUTH_TOKEN", "").strip()
+    if not token:
+        raise RuntimeError(
+            "MCP_AUTH_TOKEN is not set: refusing to start without authentication. "
+            "Generate one with `openssl rand -hex 32`, put it in .env / the "
+            "environment, and restart."
+        )
+    return token
+
+
 def main() -> None:
+    try:
+        token = _require_auth_token()
+    except RuntimeError as exc:
+        raise SystemExit(str(exc)) from exc
+
+    logger = logging.getLogger("uvicorn.error")
+    if HOST not in ("127.0.0.1", "::1", "localhost"):
+        logger.warning(
+            "MCP server is binding %s:%s: reachable from the network. "
+            "Keep MCP_AUTH_TOKEN secret and restrict access with a firewall.",
+            HOST,
+            PORT,
+        )
+
     app = mcp.streamable_http_app()
-    if AUTH_TOKEN:
-        app.add_middleware(BearerAuthMiddleware, token=AUTH_TOKEN)
+    app.add_middleware(BearerAuthMiddleware, token=token)
     uvicorn.run(app, host=HOST, port=PORT, log_level=os.environ.get("MCP_LOG_LEVEL", "info"))
 
 

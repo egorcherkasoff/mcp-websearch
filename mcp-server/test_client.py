@@ -29,7 +29,14 @@ def show(title: str, obj: object) -> None:
 
 
 async def main() -> int:
-    headers = {"Authorization": f"Bearer {TOKEN}"} if TOKEN else {}
+    if not TOKEN:
+        print(
+            "MCP_AUTH_TOKEN is empty: the server refuses unauthenticated requests, "
+            "set the token and retry",
+            file=sys.stderr,
+        )
+        return 2
+    headers = {"Authorization": f"Bearer {TOKEN}"}
     async with streamablehttp_client(MCP_URL, headers=headers) as streams:
         read, write = streams[0], streams[1]
         async with ClientSession(read, write) as session:

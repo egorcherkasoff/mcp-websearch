@@ -1,7 +1,9 @@
 # MCP web-search / scraping stack: SearXNG + Crawl4AI + MCP wrapper.
 #
-# Private deployment: published ports are meant to be reachable only from the
-# local network (LAN) or a ZeroTier network. Never expose them to the internet.
+# Private deployment: published ports bind to 127.0.0.1 by default. To reach the
+# stack from a LAN / ZeroTier network set BIND_ADDR explicitly (e.g. 0.0.0.0 or
+# the ZeroTier IP), keep MCP_AUTH_TOKEN secret and never expose the ports to the
+# internet.
 name: mcp-websearch
 
 services:
@@ -23,7 +25,7 @@ services:
       - ./searxng/core-config:/etc/searxng:rw
       - searxng-data:/var/cache/searxng
     ports:
-      - "${BIND_ADDR:-0.0.0.0}:${SEARXNG_PORT:-8088}:8080"
+      - "${BIND_ADDR:-127.0.0.1}:${SEARXNG_PORT:-8088}:8080"
     networks: [websearch]
     healthcheck:
       test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:8080/healthz"]
@@ -70,12 +72,18 @@ services:
       SEARXNG_URL: http://searxng:8080
       CRAWL4AI_URL: http://crawl4ai:11235
       CRAWL4AI_API_TOKEN: ${CRAWL4AI_API_TOKEN:?CRAWL4AI_API_TOKEN is not set - create .env from .env.example}
+      # Required: the server refuses to start without a bearer token (fail closed).
       MCP_AUTH_TOKEN: ${MCP_AUTH_TOKEN:?MCP_AUTH_TOKEN is not set - create .env from .env.example}
+      # 0.0.0.0 is correct *inside* the container: external reachability is
+      # controlled by BIND_ADDR on the published port below.
       MCP_HOST: 0.0.0.0
       MCP_PORT: "8765"
       MCP_HTTP_TIMEOUT: "300"
+      # SSRF guard: scrape tools refuse private/internal targets unless this is
+      # explicitly set to "true".
+      MCP_ALLOW_PRIVATE_TARGETS: ${MCP_ALLOW_PRIVATE_TARGETS:-false}
     ports:
-      - "${BIND_ADDR:-0.0.0.0}:${MCP_PORT:-8765}:8765"
+      - "${BIND_ADDR:-127.0.0.1}:${MCP_PORT:-8765}:8765"
     depends_on:
       searxng:
         condition: service_healthy

@@ -10,7 +10,7 @@ WORKDIR /app
 COPY requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY server.py test_client.py ./
+COPY server.py test_client.py test_server.py ./
 
 EXPOSE 8765
 
